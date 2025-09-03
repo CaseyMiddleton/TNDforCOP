@@ -2,3 +2,4 @@ data/
 figs/
 fitting_data*
 **/.DS_Store
+add_cov*
