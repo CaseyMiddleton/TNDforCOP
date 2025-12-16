@@ -10,9 +10,6 @@ def clamp(x):
 def sigmoid(x, steepness, mid_point, saturating_point=1):
     return saturating_point / (1 + np.exp(-steepness * (x - mid_point)))
 
-def linear(x, m, b):
-    return clamp(m * x + b)
-
 def threshold(x, thresh, max_val):
     return np.where(x < thresh, 0.0, max_val)
 
@@ -47,12 +44,10 @@ class RiskReductionModel:
     def calculate_RR(self, log_Ab):
         if self.relationship_type == 'sigmoid':
             return sigmoid(log_Ab, self.params.get('steepness', 5), self.params.get('mid_point', 3), self.params.get('saturating_point', 1))
-        elif self.relationship_type == 'linear':
-            return linear(log_Ab, self.params.get('m', 0.5), self.params.get('b', -1))
         elif self.relationship_type == 'threshold':
-            return threshold(log_Ab, self.params.get('thresh', 3), self.params.get('max_val', 1))
+            return threshold(log_Ab, self.params.get('thresh', 6), self.params.get('max_val', 1))
         elif self.relationship_type == 'exponential':
-            return exponential(log_Ab, self.params.get('x_intercept', 1), self.params.get('steepness', -1))
+            return exponential(log_Ab, self.params.get('x_intercept', 1), self.params.get('steepness', -.6))
         elif self.relationship_type == 'no_relationship':
             return no_relationship(log_Ab)
         else:
@@ -71,13 +66,17 @@ def get_lognormal_Ab_titers(size: int) -> np.ndarray:
     log_Abs = np.clip(np.log(Abs),1,10)
     return log_Abs
 
-def generate_TND_data(N, protection_function, protection_params=None, controls_per_case=4, Ab_distribution=get_loguniform_Ab_titers, prot_func="logged"):
+def generate_TND_data(N, protection_function, protection_params=None, controls_per_case=4, 
+                      Ab_distribution=get_loguniform_Ab_titers):
     '''
     Generate test-negative design data under the following parameters:
         N - number of individuals in the study population
         protection_function - link function connecting antibody titer to risk reduction
             options: 'threshold', 'sigmoid', 'none'
         protection_params - parameters for protection function
+        controls_per_case - ratio of controls to cases in synthetic data
+        Ab_distribution - distribution from which logged antibody titers are drawn
+            options: get_log_uniform_Ab_titers (default), get_uniform_Ab_titers, get_lognormal_Ab_titers
     Returns samples of [x, y] where x is the sampled antibody titer and y is positive or negative (0/1)
     '''
     Ab_titers = np.array([])
@@ -98,10 +97,7 @@ def generate_TND_data(N, protection_function, protection_params=None, controls_p
     test_results = np.concatenate((test_results, np.zeros(num_desired_controls)))
 
     # Generate cases
-    if prot_func == "logged":
-        risk_reduction = RR_model.calculate_RR(pop_Abs)
-    elif prot_func == "unlogged":
-        risk_reduction = RR_model.calculate_RR(np.exp(pop_Abs))
+    risk_reduction = RR_model.calculate_RR(pop_Abs)
     prob_sampled = (1 - risk_reduction) / np.sum(1 - risk_reduction)
     cases = np.random.choice(pop_Abs, num_desired_cases, replace=False, p=prob_sampled)
     Ab_titers = np.concatenate((Ab_titers, cases))
@@ -109,3 +105,66 @@ def generate_TND_data(N, protection_function, protection_params=None, controls_p
 
     return [Ab_titers, test_results]
 
+def generate_TND_data_cov(N, protection_function, protection_params=None, controls_per_case=4, 
+                prop_vax = 0.7, prop_PI = 0.7, PI_boost = 0.4):
+    '''
+    Generate test-negative design data *with covariates* under the following parameters:
+        N - number of individuals in the study population
+        protection_function - link function connecting antibody titer to risk reduction
+            options: 'exponential','threshold', 'sigmoid', 'none'
+        protection_params - parameters for protection function
+        controls_per_case - ratio of controls to cases in synthetic data
+        prop_vax, prop_PI - proportion of population that is vaccinated and previously infected, respectively
+        PI_boost - boost in protection from prior infection
+    Returns 
+        tuple of antibody titers, vaccination status, and positive/negative infection status
+    '''
+    # Set constants
+    num_desired_cases = int(N / (controls_per_case + 1))
+    num_desired_controls = int(N - num_desired_cases)
+    pop_to_simulate = N * 10  # Study population will be approximately 10x the study sample
+    
+    prop_both = prop_vax * prop_PI # assumes vaccination and prior infection are independent
+    N_vax = int(pop_to_simulate * (prop_vax - prop_both))
+    N_PI = int(pop_to_simulate * (prop_PI - prop_both))
+    N_both = int(pop_to_simulate * prop_both)
+    N_none = int(pop_to_simulate - (N_vax + N_PI + N_both))
+
+    # Generate simulated population with antibody titers
+    Abs_both = get_loguniform_Ab_titers_high(N_both)
+    Abs_vax = get_loguniform_Ab_titers_moderate(N_vax)
+    Abs_PI = get_loguniform_Ab_titers_moderate(N_PI)
+    Abs_none = np.zeros(N_none)
+    pop_Abs = np.concatenate((Abs_both,Abs_vax,Abs_PI,Abs_none))
+
+    # Estimate risk reduction from antibody titers
+    RR_model = RiskReductionModel(protection_function, **(protection_params or {}))
+    risk_reduction_Ab = RR_model.calculate_RR(pop_Abs)
+
+    # Track vaccination status, prior infection status, and associated risk reduction
+    pop_vax_status = np.concatenate((np.ones(N_both+N_vax),np.zeros(N_PI+N_none)))
+    pop_PI_status = np.concatenate((np.ones(N_both), np.zeros(N_vax),np.ones(N_PI),np.zeros(N_none)))
+    risk_reduction_PI = PI_boost * pop_PI_status
+
+    # Overall probability of infection
+    inf_prob = (1 - risk_reduction_Ab) * (1 - risk_reduction_PI)
+    # Normalize to sampling probabilities for cases
+    prob_cases = inf_prob / np.sum(inf_prob)
+
+    # Sample cases from whole population
+    case_indices = np.random.choice(np.arange(pop_to_simulate), 
+                                    size=num_desired_cases, 
+                                    replace=False, 
+                                    p=prob_cases)
+    
+    # Generate controls 
+    control_indices = np.random.choice(np.arange(pop_to_simulate), 
+                                       size=num_desired_controls, 
+                                       replace=False)
+
+    # Collect and return sampled data
+    sampled_Abs = np.concatenate([pop_Abs[control_indices], pop_Abs[case_indices]])
+    sampled_y = np.concatenate([np.zeros(len(control_indices)), np.ones(len(case_indices))])
+    sampled_vax_status = np.concatenate([pop_vax_status[control_indices], pop_vax_status[case_indices]])
+    
+    return sampled_Abs, sampled_vax_status, sampled_y
